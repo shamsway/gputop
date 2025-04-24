@@ -55,6 +55,33 @@ static LIST_HEAD(gpu_vendors);
 
 void register_gpu_vendor(struct gpu_vendor *vendor) { list_add(&vendor->list, &gpu_vendors); }
 
+extern struct gpu_vendor gpu_vendor_nvidia;
+extern struct gpu_vendor gpu_vendor_intel;
+extern struct gpu_vendor gpu_vendor_amdsmi;
+extern struct gpu_vendor gpu_vendor_v3d;
+extern struct gpu_vendor gpu_vendor_apple;
+extern struct gpu_vendor gpu_vendor_msm;
+extern struct gpu_vendor gpu_vendor_panfrost;
+extern struct gpu_vendor gpu_vendor_panthor;
+extern struct gpu_vendor gpu_vendor_tpu;
+extern struct gpu_vendor gpu_vendor_ascend;
+
+static bool __attribute__((constructor)) gpuinfo_constructor() {
+#ifdef NVIDIA_SUPPORT
+  register_gpu_vendor(&gpu_vendor_nvidia);
+#endif
+#ifdef INTEL_SUPPORT
+  register_gpu_vendor(&gpu_vendor_intel);
+#endif
+#ifdef AMDGPU_SUPPORT
+  register_gpu_vendor(&gpu_vendor_amdsmi);
+#endif
+#ifdef V3D_SUPPORT
+  register_gpu_vendor(&gpu_vendor_v3d);
+#endif
+  return true;
+}
+
 bool gpuinfo_init_info_extraction(unsigned *monitored_dev_count, struct list_head *devices) {
   struct gpu_vendor *vendor;
 
@@ -120,8 +147,8 @@ bool gpuinfo_fix_dynamic_info_from_process_info(struct list_head *devices) {
     unsigned reportedGpuRate = dynamic_info->gpu_util_rate;
     RESET_GPUINFO_DYNAMIC(dynamic_info, gpu_util_rate);
 
-    // AMDGPU does not provide encode and decode utilization through the DRM sensor info.
-    // Update them here since per-process sysfs exposes this information.
+    // AMDGPU/AMDSMI does not provide encode and decode utilization through the DRM sensor info.
+    // Update them here since per-process sysfs/amdsmi exposes this information.
     bool needGpuEncode = !GPUINFO_DYNAMIC_FIELD_VALID(dynamic_info, encoder_rate);
     bool needGpuDecode = !GPUINFO_DYNAMIC_FIELD_VALID(dynamic_info, decoder_rate);
     if (needGpuRate || needGpuEncode || needGpuDecode) {

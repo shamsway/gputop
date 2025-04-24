@@ -88,8 +88,27 @@ if(AMDGPU_SUPPORT OR INTEL_SUPPORT OR MSM_SUPPORT OR PANFROST_SUPPORT OR PANTHOR
 endif()
 
 if (AMDGPU_SUPPORT)
-  target_sources(nvtop PRIVATE extract_gpuinfo_amdgpu.c)
-  target_sources(nvtop PRIVATE extract_gpuinfo_amdgpu_utils.c)
+  # Search for libamd_smi for AMD SMI support (preferred over libdrm for AMD)
+  find_library(AMDSMI_LIBRARY amd_smi)
+  if(AMDSMI_LIBRARY)
+    message(STATUS "Found libamd_smi; Enabling AMD SMI support")
+    # Define HAVE_AMDSMI only if the library is found
+    target_compile_definitions(nvtop PRIVATE HAVE_AMDSMI)
+    # Include directories might be needed if headers aren't in standard paths
+    # find_path(AMDSMI_INCLUDE_DIR NAMES amd_smi/amdsmi.h PATHS /opt/rocm/include /usr/include)
+    # if(AMDSMI_INCLUDE_DIR)
+    #   target_include_directories(nvtop PRIVATE ${AMDSMI_INCLUDE_DIR})
+    # else()
+    #   message(WARNING "libamd_smi found, but amd_smi/amdsmi.h header not found. Build might fail.")
+    # endif()
+    target_link_libraries(nvtop PRIVATE ${AMDSMI_LIBRARY})
+  else()
+    message(STATUS "libamd_smi not found; Falling back to libdrm/sysfs for AMDGPU support if possible.")
+    # Optionally, you could make this a WARNING or FATAL_ERROR if libamd_smi becomes mandatory
+  endif()
+
+  target_sources(nvtop PRIVATE extract_gpuinfo_amdsmi.c)
+  target_sources(nvtop PRIVATE extract_gpuinfo_amdsmi_utils.c)
 endif()
 
 if (MSM_SUPPORT)

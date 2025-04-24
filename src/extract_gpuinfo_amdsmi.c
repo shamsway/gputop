@@ -34,8 +34,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+// Conditional include based on CMake detection
+#ifdef HAVE_AMDSMI
+#include <amd_smi/amdsmi.h>
+#else
+// Only include these if AMDSMI is NOT available (fallback)
 #include <libdrm/amdgpu.h>
 #include <libdrm/amdgpu_drm.h>
+#include <xf86drm.h>
+#endif
 #include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -47,10 +54,47 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <uthash.h>
-#include <xf86drm.h>
+#include <uuid/uuid.h> // For UUID handling
 
 // extern
+#ifndef HAVE_AMDSMI
+// Only declare if AMDSMI is NOT available (fallback)
 const char *amdgpu_parse_marketing_name(struct amdgpu_gpu_info *info);
+#endif
+
+#ifdef HAVE_AMDSMI
+// Local function pointers to AMD SMI library
+static typeof(amdsmi_init) *_amdsmi_init;
+static typeof(amdsmi_shut_down) *_amdsmi_shut_down;
+static typeof(amdsmi_get_processor_handles) *_amdsmi_get_processor_handles;
+static typeof(amdsmi_get_processor_type) *_amdsmi_get_processor_type;
+static typeof(amdsmi_get_gpu_device_uuid) *_amdsmi_get_gpu_device_uuid;
+static typeof(amdsmi_get_gpu_device_bdf) *_amdsmi_get_gpu_device_bdf;
+static typeof(amdsmi_get_gpu_compute_partition) *_amdsmi_get_gpu_compute_partition;
+static typeof(amdsmi_get_gpu_memory_partition) *_amdsmi_get_gpu_memory_partition;
+static typeof(amdsmi_get_gpu_asic_info) *_amdsmi_get_gpu_asic_info;
+static typeof(amdsmi_get_gpu_board_info) *_amdsmi_get_gpu_board_info;
+static typeof(amdsmi_get_gpu_vram_info) *_amdsmi_get_gpu_vram_info;
+static typeof(amdsmi_get_gpu_vram_usage) *_amdsmi_get_gpu_vram_usage;
+static typeof(amdsmi_get_clock_info) *_amdsmi_get_clock_info;
+static typeof(amdsmi_get_temp_metric) *_amdsmi_get_temp_metric;
+static typeof(amdsmi_get_gpu_fan_speed) *_amdsmi_get_gpu_fan_speed;
+static typeof(amdsmi_get_power_info) *_amdsmi_get_power_info;
+static typeof(amdsmi_get_power_cap_info) *_amdsmi_get_power_cap_info;
+static typeof(amdsmi_get_pcie_link_status) *_amdsmi_get_pcie_link_status;
+static typeof(amdsmi_get_pcie_link_caps) *_amdsmi_get_pcie_link_caps;
+static typeof(amdsmi_get_pcie_throughput) *_amdsmi_get_pcie_throughput;
+static typeof(amdsmi_get_gpu_activity) *_amdsmi_get_gpu_activity;
+static typeof(amdsmi_get_gpu_process_list) *_amdsmi_get_gpu_process_list;
+static typeof(amdsmi_get_gpu_process_info) *_amdsmi_get_gpu_process_info;
+static typeof(amdsmi_status_code_to_string) *_amdsmi_status_code_to_string;
+static typeof(amdsmi_get_gpu_metrics) *_amdsmi_get_gpu_metrics;
+static typeof(amdsmi_get_pcie_bandwidth) *_amdsmi_get_pcie_bandwidth;
+// Add other needed amdsmi function pointers here...
+
+static void *libamdsmi_handle;
+
+#else // Fallback to libdrm/amdgpu definitions
 
 // Local function pointers to DRM interface
 static typeof(drmGetDevices) *_drmGetDevices;
@@ -75,89 +119,107 @@ static void *libdrm_handle;
 static void *libdrm_amdgpu_handle;
 
 static int last_libdrm_return_status = 0;
+#endif
+
 static char didnt_call_gpuinfo_init[] = "uninitialized";
 static const char *local_error_string = didnt_call_gpuinfo_init;
 
-#define HASH_FIND_CLIENT(head, key_ptr, out_ptr) HASH_FIND(hh, head, key_ptr, sizeof(struct unique_cache_id), out_ptr)
+// Process cache structures remain the same for now, but keys might change
+// if we don't rely on DRM client_id anymore.
+#define HASH_FIND_PID_PDEV(head, pid_key, pdev_key, out_ptr)\
+    HASH_FIND(hh, head, &(struct unique_cache_id){.pid = pid_key, .pdev = pdev_key}, sizeof(struct unique_cache_id), out_ptr)
+#define HASH_ADD_PID_PDEV(head, in_ptr)\
+    HASH_ADD(hh, head, client_id, sizeof(struct unique_cache_id), in_ptr)
 
-#define HASH_ADD_CLIENT(head, in_ptr) HASH_ADD(hh, head, client_id, sizeof(struct unique_cache_id), in_ptr)
-
-#define SET_AMDGPU_CACHE(cachePtr, field, value) SET_VALUE(cachePtr, field, value, amdgpu_cache_)
-#define RESET_AMDGPU_CACHE(cachePtr, field) INVALIDATE_VALUE(cachePtr, field, amdgpu_cache_)
-#define AMDGPU_CACHE_FIELD_VALID(cachePtr, field) VALUE_IS_VALID(cachePtr, field, amdgpu_cache_)
-
-enum amdgpu_process_info_cache_valid {
-  amdgpu_cache_gfx_engine_used_valid = 0,
-  amdgpu_cache_compute_engine_used_valid,
-  amdgpu_cache_enc_engine_used_valid,
-  amdgpu_cache_dec_engine_used_valid,
-  amdgpu_cache_process_info_cache_valid_count
-};
-
+// Structure to hold unique identifier for process cache (using pid + pdev)
 struct __attribute__((__packed__)) unique_cache_id {
-  unsigned client_id;
+  // unsigned client_id; // No longer needed from DRM
   pid_t pid;
-  char *pdev;
+  char *pdev; // Keep pdev for now, or maybe use handle?
+  // Consider adding processor handle if needed for uniqueness across partitions
 };
 
-struct amdgpu_process_info_cache {
-  struct unique_cache_id client_id;
-  uint64_t gfx_engine_used;
-  uint64_t compute_engine_used;
-  uint64_t enc_engine_used;
-  uint64_t dec_engine_used;
+// Process info cache needs adjustment for AMDSMI usage data
+struct amdsmi_process_info_cache {
+  struct unique_cache_id client_id; // Re-evaluate key if needed
+  // Store engine usage in nanoseconds from AMDSMI
+  uint64_t gfx_engine_ns;
+  uint64_t compute_engine_ns; // AMDSMI might not separate compute explicitly
+  uint64_t enc_engine_ns;
+  uint64_t dec_engine_ns;
+  // Add other engine types if provided by AMDSMI (e.g., mm_engine_ns?)
   nvtop_time last_measurement_tstamp;
-  unsigned char valid[(amdgpu_cache_process_info_cache_valid_count + CHAR_BIT - 1) / CHAR_BIT];
+  // Validation bits might need adjustment based on available AMDSMI process data
+  unsigned char valid[1]; // Adjust size based on actual fields
   UT_hash_handle hh;
 };
 
-struct gpu_info_amdgpu {
+// Define the main struct for AMDSMI
+struct gpu_info_amdsmi {
   struct gpu_info base;
 
+#ifdef HAVE_AMDSMI
+  amdsmi_processor_handle processor_handle;
+  char physical_gpu_uuid_str[37]; // Standard UUID string length + null terminator
+  unsigned partition_index;
+  // No longer need drmVersion, fd, amdgpu_device_handle, sysfs FILE*
+#else
+  // Keep existing libdrm fields for fallback
   drmVersionPtr drmVersion;
   int fd;
   amdgpu_device_handle amdgpu_device;
+  FILE *fanSpeedFILE;
+  FILE *PCIeBW;
+  FILE *powerCap;
+  nvtop_device *amdgpuDevice;
+  nvtop_device *hwmonDevice;
+#endif
 
-  // We poll the fan frequently enough and want to avoid the open/close overhead of the sysfs file
-  FILE *fanSpeedFILE; // FILE* for this device current fan speed
-  FILE *PCIeBW;       // FILE* for this device PCIe bandwidth over one second
-  FILE *powerCap;     // FILE* for this device power cap
+  // Adjust process cache type and maybe name
+  struct amdsmi_process_info_cache *last_update_process_cache, *current_update_process_cache;
 
-  nvtop_device *amdgpuDevice; // The AMDGPU driver device
-  nvtop_device *hwmonDevice;  // The AMDGPU driver hwmon device
-
-  struct amdgpu_process_info_cache *last_update_process_cache, *current_update_process_cache; // Cached processes info
-
-  // Used to compute the actual fan speed
+#ifndef HAVE_AMDSMI // Only needed for libdrm fallback
   unsigned maxFanValue;
+#endif
 };
 
-unsigned amdgpu_count;
-static struct gpu_info_amdgpu *gpu_infos;
+unsigned amdsmi_count; // Renamed from amdgpu_count
+static struct gpu_info_amdsmi *gpu_infos; // Renamed
 
-static bool gpuinfo_amdgpu_init(void);
-static void gpuinfo_amdgpu_shutdown(void);
-static const char *gpuinfo_amdgpu_last_error_string(void);
-static bool gpuinfo_amdgpu_get_device_handles(struct list_head *devices, unsigned *count);
-static void gpuinfo_amdgpu_populate_static_info(struct gpu_info *_gpu_info);
-static void gpuinfo_amdgpu_refresh_dynamic_info(struct gpu_info *_gpu_info);
-static void gpuinfo_amdgpu_get_running_processes(struct gpu_info *_gpu_info);
+// Function declarations need renaming and potentially signature changes
+static bool gpuinfo_amdsmi_init(void);
+static void gpuinfo_amdsmi_shutdown(void);
+static const char *gpuinfo_amdsmi_last_error_string(void);
+static bool gpuinfo_amdsmi_get_device_handles(struct list_head *devices, unsigned *count);
+static void gpuinfo_amdsmi_populate_static_info(struct gpu_info *_gpu_info);
+static void gpuinfo_amdsmi_refresh_dynamic_info(struct gpu_info *_gpu_info);
+static void gpuinfo_amdsmi_get_running_processes(struct gpu_info *_gpu_info);
 
-struct gpu_vendor gpu_vendor_amdgpu = {
-    .init = gpuinfo_amdgpu_init,
-    .shutdown = gpuinfo_amdgpu_shutdown,
-    .last_error_string = gpuinfo_amdgpu_last_error_string,
-    .get_device_handles = gpuinfo_amdgpu_get_device_handles,
-    .populate_static_info = gpuinfo_amdgpu_populate_static_info,
-    .refresh_dynamic_info = gpuinfo_amdgpu_refresh_dynamic_info,
-    .refresh_running_processes = gpuinfo_amdgpu_get_running_processes,
-    .name = "AMD",
+// Update the vendor struct registration
+struct gpu_vendor gpu_vendor_amdsmi = {
+    .init = gpuinfo_amdsmi_init,
+    .shutdown = gpuinfo_amdsmi_shutdown,
+    .last_error_string = gpuinfo_amdsmi_last_error_string,
+    .get_device_handles = gpuinfo_amdsmi_get_device_handles,
+    .populate_static_info = gpuinfo_amdsmi_populate_static_info,
+    .refresh_dynamic_info = gpuinfo_amdsmi_refresh_dynamic_info,
+    .refresh_running_processes = gpuinfo_amdsmi_get_running_processes,
+    .name = "AMD", // Keep name as AMD
 };
 
+// Need to remove or #ifdef out functions relying solely on DRM/sysfs
+#ifndef HAVE_AMDSMI
 static int readAttributeFromDevice(nvtop_device *dev, const char *sysAttr, const char *format, ...);
+#endif
 
-__attribute__((constructor)) static void init_extract_gpuinfo_amdgpu(void) { register_gpu_vendor(&gpu_vendor_amdgpu); }
+__attribute__((constructor)) static void init_extract_gpuinfo_amdsmi(void) {
+#ifdef AMDGPU_SUPPORT // Keep CMake build flag guard
+  register_gpu_vendor(&gpu_vendor_amdsmi);
+#endif
+}
 
+#ifndef HAVE_AMDSMI
+// Keep libdrm-specific helpers only for fallback
 static int wrap_drmGetDevices(drmDevicePtr devices[], int max_devices) {
   assert(_drmGetDevices2 || _drmGetDevices);
 
@@ -167,8 +229,83 @@ static int wrap_drmGetDevices(drmDevicePtr devices[], int max_devices) {
 }
 
 static bool parse_drm_fdinfo_amd(struct gpu_info *info, FILE *fdinfo_file, struct gpu_process *process_info);
+#endif
 
-static bool gpuinfo_amdgpu_init(void) {
+static bool gpuinfo_amdsmi_init(void) {
+#ifdef HAVE_AMDSMI
+  libamdsmi_handle = dlopen("libamd_smi.so", RTLD_LAZY);
+  // Try versioned names if the base name fails
+  if (!libamdsmi_handle)
+    libamdsmi_handle = dlopen("libamd_smi.so.1", RTLD_LAZY); // Example version
+
+  if (!libamdsmi_handle) {
+    local_error_string = dlerror();
+    return false;
+  }
+
+  // Load all required amdsmi functions using dlsym
+  _amdsmi_init = dlsym(libamdsmi_handle, "amdsmi_init");
+  _amdsmi_shut_down = dlsym(libamdsmi_handle, "amdsmi_shut_down");
+  _amdsmi_get_processor_handles = dlsym(libamdsmi_handle, "amdsmi_get_processor_handles");
+  _amdsmi_get_processor_type = dlsym(libamdsmi_handle, "amdsmi_get_processor_type");
+  _amdsmi_get_gpu_device_uuid = dlsym(libamdsmi_handle, "amdsmi_get_gpu_device_uuid");
+  _amdsmi_get_gpu_device_bdf = dlsym(libamdsmi_handle, "amdsmi_get_gpu_device_bdf");
+  _amdsmi_get_gpu_compute_partition = dlsym(libamdsmi_handle, "amdsmi_get_gpu_compute_partition");
+  _amdsmi_get_gpu_memory_partition = dlsym(libamdsmi_handle, "amdsmi_get_gpu_memory_partition");
+  _amdsmi_get_gpu_asic_info = dlsym(libamdsmi_handle, "amdsmi_get_gpu_asic_info");
+  _amdsmi_get_gpu_board_info = dlsym(libamdsmi_handle, "amdsmi_get_gpu_board_info");
+  _amdsmi_get_gpu_vram_info = dlsym(libamdsmi_handle, "amdsmi_get_gpu_vram_info");
+  _amdsmi_get_gpu_vram_usage = dlsym(libamdsmi_handle, "amdsmi_get_gpu_vram_usage");
+  _amdsmi_get_clock_info = dlsym(libamdsmi_handle, "amdsmi_get_clock_info");
+  _amdsmi_get_temp_metric = dlsym(libamdsmi_handle, "amdsmi_get_temp_metric");
+  _amdsmi_get_gpu_fan_speed = dlsym(libamdsmi_handle, "amdsmi_get_gpu_fan_speed");
+  _amdsmi_get_power_info = dlsym(libamdsmi_handle, "amdsmi_get_power_info");
+  _amdsmi_get_power_cap_info = dlsym(libamdsmi_handle, "amdsmi_get_power_cap_info");
+  _amdsmi_get_pcie_link_status = dlsym(libamdsmi_handle, "amdsmi_get_pcie_link_status");
+  _amdsmi_get_pcie_link_caps = dlsym(libamdsmi_handle, "amdsmi_get_pcie_link_caps");
+  _amdsmi_get_pcie_throughput = dlsym(libamdsmi_handle, "amdsmi_get_pcie_throughput");
+  _amdsmi_get_gpu_activity = dlsym(libamdsmi_handle, "amdsmi_get_gpu_activity");
+  _amdsmi_get_gpu_process_list = dlsym(libamdsmi_handle, "amdsmi_get_gpu_process_list");
+  _amdsmi_get_gpu_process_info = dlsym(libamdsmi_handle, "amdsmi_get_gpu_process_info");
+  _amdsmi_status_code_to_string = dlsym(libamdsmi_handle, "amdsmi_status_code_to_string");
+  _amdsmi_get_gpu_metrics = dlsym(libamdsmi_handle, "amdsmi_get_gpu_metrics");
+  _amdsmi_get_pcie_bandwidth = dlsym(libamdsmi_handle, "amdsmi_get_pcie_bandwidth");
+
+  // Check essential functions needed for basic operation and info gathering
+  if (!_amdsmi_init || !_amdsmi_shut_down || !_amdsmi_get_processor_handles ||
+      !_amdsmi_get_processor_type || !_amdsmi_get_gpu_device_uuid || !_amdsmi_get_gpu_device_bdf ||
+      !_amdsmi_status_code_to_string ||
+      // Static info functions
+      !_amdsmi_get_gpu_asic_info || !_amdsmi_get_gpu_board_info || !_amdsmi_get_gpu_vram_info ||
+      !_amdsmi_get_clock_info || !_amdsmi_get_temp_metric || !_amdsmi_get_pcie_link_caps ||
+      // Dynamic info functions (for refresh)
+      !_amdsmi_get_gpu_metrics || !_amdsmi_get_gpu_vram_usage || !_amdsmi_get_pcie_bandwidth ||
+      // Optional but useful static info
+      !_amdsmi_get_gpu_fan_speed || !_amdsmi_get_power_info || !_amdsmi_get_power_cap_info ||
+      !_amdsmi_get_pcie_link_status ||
+      // Process list functions (potentially optional depending on usage)
+      !_amdsmi_get_gpu_process_list || !_amdsmi_get_gpu_process_info
+      // !_amdsmi_get_gpu_activity // Keep activity optional for now
+     ) {
+    local_error_string = "Failed to load required AMD SMI functions";
+    // Potentially use _amdsmi_status_code_to_string(ret, &local_error_string) if safe after failed init
+    dlclose(libamdsmi_handle);
+    libamdsmi_handle = NULL;
+    return false;
+  }
+
+  // Initialize the AMD SMI library
+  amdsmi_status_t ret = _amdsmi_init(0); // Flags = 0 for now
+  if (ret != AMDSMI_STATUS_SUCCESS) {
+    // Use status_code_to_string? Need to load it first even if init fails...
+    local_error_string = "amdsmi_init failed"; // Placeholder
+    // Potentially use _amdsmi_status_code_to_string(ret, &local_error_string) if safe after failed init
+    dlclose(libamdsmi_handle);
+    libamdsmi_handle = NULL;
+    return false;
+  }
+
+#else // Fallback to libdrm initialization
   libdrm_handle = dlopen("libdrm.so", RTLD_LAZY);
   if (!libdrm_handle)
     libdrm_handle = dlopen("libdrm.so.2", RTLD_LAZY);
@@ -230,11 +367,13 @@ init_error_clean_exit:
   dlclose(libdrm_handle);
   libdrm_handle = NULL;
   return false;
+#endif
 }
 
-static void gpuinfo_amdgpu_shutdown(void) {
-  for (unsigned i = 0; i < amdgpu_count; ++i) {
-    struct gpu_info_amdgpu *gpu_info = &gpu_infos[i];
+static void gpuinfo_amdsmi_shutdown(void) {
+#ifdef HAVE_AMDSMI
+  for (unsigned i = 0; i < amdsmi_count; ++i) {
+    struct gpu_info_amdsmi *gpu_info = &gpu_infos[i];
     if (gpu_info->fanSpeedFILE)
       fclose(gpu_info->fanSpeedFILE);
     if (gpu_info->PCIeBW)
@@ -246,7 +385,7 @@ static void gpuinfo_amdgpu_shutdown(void) {
     _drmFreeVersion(gpu_info->drmVersion);
     _amdgpu_device_deinitialize(gpu_info->amdgpu_device);
     // Clean the process cache
-    struct amdgpu_process_info_cache *cache_entry, *cache_tmp;
+    struct amdsmi_process_info_cache *cache_entry, *cache_tmp;
     HASH_ITER(hh, gpu_info->last_update_process_cache, cache_entry, cache_tmp) {
       HASH_DEL(gpu_info->last_update_process_cache, cache_entry);
       free(cache_entry);
@@ -254,11 +393,11 @@ static void gpuinfo_amdgpu_shutdown(void) {
   }
   free(gpu_infos);
   gpu_infos = NULL;
-  amdgpu_count = 0;
+  amdsmi_count = 0;
 
-  if (libdrm_handle) {
-    dlclose(libdrm_handle);
-    libdrm_handle = NULL;
+  if (libamdsmi_handle) {
+    dlclose(libamdsmi_handle);
+    libamdsmi_handle = NULL;
     local_error_string = didnt_call_gpuinfo_init;
   }
 
@@ -266,9 +405,10 @@ static void gpuinfo_amdgpu_shutdown(void) {
     dlclose(libdrm_amdgpu_handle);
     libdrm_amdgpu_handle = NULL;
   }
+#endif
 }
 
-static const char *gpuinfo_amdgpu_last_error_string(void) {
+static const char *gpuinfo_amdsmi_last_error_string(void) {
   if (local_error_string) {
     return local_error_string;
   } else if (last_libdrm_return_status < 0) {
@@ -316,7 +456,7 @@ static void authenticate_drm(int fd) {
   fprintf(stderr, "Failed to authenticate to DRM; XCB authentication unimplemented\n");
 }
 
-static void initDeviceSysfsPaths(struct gpu_info_amdgpu *gpu_info) {
+static void initDeviceSysfsPaths(struct gpu_info_amdsmi *gpu_info) {
   // Open the device sys folder to gather information not available through the DRM driver
   char devicePath[22 + PDEV_LEN];
   snprintf(devicePath, sizeof(devicePath), "/sys/bus/pci/devices/%s", gpu_info->base.pdev);
@@ -382,7 +522,160 @@ static void initDeviceSysfsPaths(struct gpu_info_amdgpu *gpu_info) {
 
 #define VENDOR_AMD 0x1002
 
-static bool gpuinfo_amdgpu_get_device_handles(struct list_head *devices, unsigned *count) {
+// Structure to hold temporary handle info for sorting
+struct temp_handle_info {
+  amdsmi_processor_handle handle;
+  uuid_t uuid;
+  char uuid_str[37];
+  uint64_t bdf;
+};
+
+// Comparison function for sorting temp_handle_info by UUID then BDF
+static int compare_handle_info(const void *a, const void *b) {
+  const struct temp_handle_info *info_a = (const struct temp_handle_info *)a;
+  const struct temp_handle_info *info_b = (const struct temp_handle_info *)b;
+
+  int uuid_cmp = uuid_compare(info_a->uuid, info_b->uuid);
+  if (uuid_cmp != 0) {
+    return uuid_cmp;
+  }
+  // Secondary sort by BDF to ensure consistent ordering within a physical GPU
+  if (info_a->bdf < info_b->bdf)
+    return -1;
+  if (info_a->bdf > info_b->bdf)
+    return 1;
+  return 0;
+}
+
+static bool gpuinfo_amdsmi_get_device_handles(struct list_head *devices, unsigned *count) {
+#ifdef HAVE_AMDSMI
+  if (!libamdsmi_handle || !_amdsmi_get_processor_handles || !_amdsmi_get_processor_type ||
+      !_amdsmi_get_gpu_device_uuid || !_amdsmi_get_gpu_device_bdf || !_amdsmi_status_code_to_string) {
+    local_error_string = "AMD SMI library or functions not loaded";
+    return false;
+  }
+
+  amdsmi_status_t ret;
+  uint32_t handle_count = 0;
+
+  // Get the number of handles
+  ret = _amdsmi_get_processor_handles(NULL, &handle_count);
+  if (ret != AMDSMI_STATUS_SUCCESS || handle_count == 0) {
+    _amdsmi_status_code_to_string(ret, &local_error_string);
+    return false;
+  }
+
+  // Allocate memory for handles
+  amdsmi_processor_handle *handles = malloc(handle_count * sizeof(amdsmi_processor_handle));
+  if (!handles) {
+    local_error_string = strerror(errno);
+    return false;
+  }
+
+  // Get the actual handles
+  ret = _amdsmi_get_processor_handles(handles, &handle_count);
+  if (ret != AMDSMI_STATUS_SUCCESS) {
+    _amdsmi_status_code_to_string(ret, &local_error_string);
+    free(handles);
+    return false;
+  }
+
+  // Filter handles, get UUIDs and BDFs for sorting
+  struct temp_handle_info *temp_handles = calloc(handle_count, sizeof(struct temp_handle_info));
+  if (!temp_handles) {
+    local_error_string = strerror(errno);
+    free(handles);
+    return false;
+  }
+
+  uint32_t gpu_handle_count = 0;
+  for (uint32_t i = 0; i < handle_count; ++i) {
+    amdsmi_processor_type_t proc_type;
+    ret = _amdsmi_get_processor_type(handles[i], &proc_type);
+    if (ret != AMDSMI_STATUS_SUCCESS || proc_type != AMDSMI_PROCESSOR_TYPE_GPU) {
+      continue; // Skip non-GPU handles
+    }
+
+    temp_handles[gpu_handle_count].handle = handles[i];
+
+    // Get UUID
+    uuid_t current_uuid;
+    ret = _amdsmi_get_gpu_device_uuid(handles[i], current_uuid);
+    if (ret != AMDSMI_STATUS_SUCCESS) {
+      _amdsmi_status_code_to_string(ret, &local_error_string);
+      // Continue processing other devices, but log this one failed?
+      continue;
+    }
+    uuid_copy(temp_handles[gpu_handle_count].uuid, current_uuid);
+    uuid_unparse_lower(current_uuid, temp_handles[gpu_handle_count].uuid_str);
+
+    // Get BDF for sorting
+    ret = _amdsmi_get_gpu_device_bdf(handles[i], &temp_handles[gpu_handle_count].bdf);
+    if (ret != AMDSMI_STATUS_SUCCESS) {
+      _amdsmi_status_code_to_string(ret, &local_error_string);
+      // Continue processing other devices, but log this one failed?
+      continue;
+    }
+
+    gpu_handle_count++;
+  }
+  free(handles); // Free original handle list
+
+  if (gpu_handle_count == 0) {
+    local_error_string = "No AMD GPUs found via SMI";
+    free(temp_handles);
+    return false;
+  }
+
+  // Sort handles by physical UUID, then BDF
+  qsort(temp_handles, gpu_handle_count, sizeof(struct temp_handle_info), compare_handle_info);
+
+  // Allocate gpu_infos based on the actual GPU count
+  gpu_infos = calloc(gpu_handle_count, sizeof(*gpu_infos));
+  if (!gpu_infos) {
+    local_error_string = strerror(errno);
+    free(temp_handles);
+    return false;
+  }
+
+  // Populate gpu_infos from sorted handles, assigning partition index
+  amdsmi_count = 0;
+  unsigned current_partition_index = 0;
+  uuid_t last_uuid;
+  uuid_clear(last_uuid);
+
+  for (uint32_t i = 0; i < gpu_handle_count; ++i) {
+    // Check if UUID changed to reset partition index
+    if (uuid_compare(last_uuid, temp_handles[i].uuid) != 0) {
+      current_partition_index = 0;
+      uuid_copy(last_uuid, temp_handles[i].uuid);
+    }
+
+    gpu_infos[amdsmi_count].processor_handle = temp_handles[i].handle;
+    strncpy(gpu_infos[amdsmi_count].physical_gpu_uuid_str, temp_handles[i].uuid_str, 37);
+    gpu_infos[amdsmi_count].partition_index = current_partition_index;
+    gpu_infos[amdsmi_count].base.vendor = &gpu_vendor_amdsmi;
+
+    // Populate pdev with BDF string format (Domain:Bus:Device.Function)
+    uint64_t bdf = temp_handles[i].bdf;
+    uint32_t domain = (bdf >> 32) & 0xFFFFFFFF;
+    uint8_t bus = (bdf >> 8) & 0xFF;
+    uint8_t device = (bdf >> 3) & 0x1F;
+    uint8_t func = bdf & 0x7;
+    snprintf(gpu_infos[amdsmi_count].base.pdev, PDEV_LEN - 1, "%04x:%02x:%02x.%d", domain, bus, device, func);
+
+    // Add to the list
+    list_add_tail(&gpu_infos[amdsmi_count].base.list, devices);
+    amdsmi_count++;
+    current_partition_index++;
+  }
+
+  free(temp_handles);
+  *count = amdsmi_count;
+  local_error_string = NULL;
+  return true;
+
+#else // Fallback to libdrm
   if (!libdrm_handle)
     return false;
 
@@ -449,24 +742,24 @@ static bool gpuinfo_amdgpu_get_device_handles(struct list_head *devices, unsigne
 
       uint32_t drm_major, drm_minor;
       last_libdrm_return_status =
-          _amdgpu_device_initialize(fd, &drm_major, &drm_minor, &gpu_infos[amdgpu_count].amdgpu_device);
+          _amdgpu_device_initialize(fd, &drm_major, &drm_minor, &gpu_infos[amdsmi_count].amdgpu_device);
     } else {
       // TODO: radeon suppport here
       assert(false);
     }
 
     if (!last_libdrm_return_status) {
-      gpu_infos[amdgpu_count].drmVersion = ver;
-      gpu_infos[amdgpu_count].fd = fd;
-      gpu_infos[amdgpu_count].base.vendor = &gpu_vendor_amdgpu;
+      gpu_infos[amdsmi_count].drmVersion = ver;
+      gpu_infos[amdsmi_count].fd = fd;
+      gpu_infos[amdsmi_count].base.vendor = &gpu_vendor_amdsmi;
 
-      snprintf(gpu_infos[amdgpu_count].base.pdev, PDEV_LEN - 1, "%04x:%02x:%02x.%d", devs[i]->businfo.pci->domain,
+      snprintf(gpu_infos[amdsmi_count].base.pdev, PDEV_LEN - 1, "%04x:%02x:%02x.%d", devs[i]->businfo.pci->domain,
                devs[i]->businfo.pci->bus, devs[i]->businfo.pci->dev, devs[i]->businfo.pci->func);
-      initDeviceSysfsPaths(&gpu_infos[amdgpu_count]);
-      list_add_tail(&gpu_infos[amdgpu_count].base.list, devices);
+      initDeviceSysfsPaths(&gpu_infos[amdsmi_count]);
+      list_add_tail(&gpu_infos[amdsmi_count].base.list, devices);
       // Register a fdinfo callback for this GPU
-      processinfo_register_fdinfo_callback(parse_drm_fdinfo_amd, &gpu_infos[amdgpu_count].base);
-      amdgpu_count++;
+      processinfo_register_fdinfo_callback(parse_drm_fdinfo_amd, &gpu_infos[amdsmi_count].base);
+      amdsmi_count++;
     } else {
       _drmFreeVersion(ver);
       close(fd);
@@ -475,9 +768,10 @@ static bool gpuinfo_amdgpu_get_device_handles(struct list_head *devices, unsigne
   }
 
   _drmFreeDevices(devs, libdrm_count);
-  *count = amdgpu_count;
+  *count = amdsmi_count;
 
   return true;
+#endif
 }
 
 static int rewindAndReadPattern(FILE *file, const char *format, ...) {
@@ -507,8 +801,123 @@ static int readAttributeFromDevice(nvtop_device *dev, const char *sysAttr, const
   return nread;
 }
 
-static void gpuinfo_amdgpu_populate_static_info(struct gpu_info *_gpu_info) {
-  struct gpu_info_amdgpu *gpu_info = container_of(_gpu_info, struct gpu_info_amdgpu, base);
+// Helper to convert GT/s to PCIe Gen (approximate)
+static unsigned pcie_gen_from_speed_gts(double speed_gts) {
+    if (speed_gts >= 31.5) return 5;
+    if (speed_gts >= 15.5) return 4;
+    if (speed_gts >= 7.5) return 3;
+    if (speed_gts >= 4.5) return 2;
+    if (speed_gts >= 2.0) return 1;
+    return 0;
+}
+
+static void gpuinfo_amdsmi_populate_static_info(struct gpu_info *_gpu_info) {
+#ifdef HAVE_AMDSMI
+  struct gpu_info_amdsmi *gpu_info = container_of(_gpu_info, struct gpu_info_amdsmi, base);
+  struct gpuinfo_static_info *static_info = &gpu_info->base.static_info;
+  amdsmi_status_t ret;
+
+  RESET_ALL(static_info->valid);
+  static_info->integrated_graphics = false; // Default, might be updated
+  static_info->encode_decode_shared = false; // Default, might be updated
+
+  // 1. Device Name
+  amdsmi_asic_info_t asic_info;
+  ret = _amdsmi_get_gpu_asic_info(gpu_info->processor_handle, &asic_info);
+  if (ret == AMDSMI_STATUS_SUCCESS && strlen(asic_info.market_name) > 0) {
+    strncpy(static_info->device_name, asic_info.market_name, MAX_DEVICE_NAME - 1);
+  } else {
+    // Fallback to board name if market name fails
+    amdsmi_board_info_t board_info;
+    ret = _amdsmi_get_gpu_board_info(gpu_info->processor_handle, &board_info);
+    if (ret == AMDSMI_STATUS_SUCCESS && strlen(board_info.product_name) > 0) {
+      strncpy(static_info->device_name, board_info.product_name, MAX_DEVICE_NAME - 1);
+    } else {
+      // Last resort: use BDF
+      strncpy(static_info->device_name, gpu_info->base.pdev, MAX_DEVICE_NAME - 1);
+    }
+  }
+  static_info->device_name[MAX_DEVICE_NAME - 1] = '\0';
+
+  // Add partition info if applicable (multiple handles share the same UUID)
+  // We need the total count of GPUs/partitions found earlier to determine this.
+  // Let's assume `amdsmi_count` holds the total count found in get_device_handles.
+  // This check needs refinement - we need to know if *this specific UUID* has multiple handles.
+  // TODO: Improve this check later, maybe pass total count for this UUID.
+  if (amdsmi_count > 1) { // Simplistic check for now
+      char partition_suffix[32];
+      snprintf(partition_suffix, sizeof(partition_suffix), " [Part %u]", gpu_info->partition_index);
+      strncat(static_info->device_name, partition_suffix, MAX_DEVICE_NAME - 1 - strlen(static_info->device_name));
+  }
+  SET_VALID(gpuinfo_device_name_valid, static_info->valid);
+
+  // 2. Temperature Thresholds (Optional, requires specific functions not loaded yet)
+  // Placeholder: If needed, load and call amdsmi_get_temp_metric for CRITICAL/EMERGENCY
+  // int64_t temp_crit_mc, temp_emerg_mc;
+  // if (_amdsmi_get_temp_metric && _amdsmi_get_temp_metric(gpu_info->processor_handle, AMDSMI_TEMP_TYPE_EDGE, AMDSMI_TEMP_METRIC_CRITICAL, &temp_crit_mc) == AMDSMI_STATUS_SUCCESS) {
+  //    SET_GPUINFO_STATIC(static_info, temperature_slowdown_threshold, temp_crit_mc / 1000);
+  // }
+  // if (_amdsmi_get_temp_metric && _amdsmi_get_temp_metric(gpu_info->processor_handle, AMDSMI_TEMP_TYPE_EDGE, AMDSMI_TEMP_METRIC_EMERGENCY, &temp_emerg_mc) == AMDSMI_STATUS_SUCCESS) {
+  //    SET_GPUINFO_STATIC(static_info, temperature_shutdown_threshold, temp_emerg_mc / 1000);
+  // }
+
+  // 3. Max PCIe Link Info
+  if (_amdsmi_get_pcie_link_caps) {
+      amdsmi_pcie_link_caps_t pcie_caps;
+      ret = _amdsmi_get_pcie_link_caps(gpu_info->processor_handle, &pcie_caps);
+      if (ret == AMDSMI_STATUS_SUCCESS) {
+          SET_GPUINFO_STATIC(static_info, max_pcie_link_width, pcie_caps.max_lanes);
+          // Speed is often reported directly in GT/s in the API struct, needs verification
+          // Assuming pcie_caps.max_speed is in GT/s (needs confirmation from amdsmi.h)
+          // double max_speed_gts = pcie_caps.max_speed; // Adjust based on actual units
+          // SET_GPUINFO_STATIC(static_info, max_pcie_gen, pcie_gen_from_speed_gts(max_speed_gts));
+          // Alternatively, pcie_caps might directly contain generation info.
+      }
+  }
+
+  // 4. Integrated Graphics (Heuristic based on name? Requires more reliable method)
+  // TODO: Find a better way using AMDSMI, perhaps vendor/device ID lookup?
+  if (strstr(static_info->device_name, "Radeon Graphics") || strstr(static_info->device_name, "Ryzen")) {
+      static_info->integrated_graphics = true;
+  }
+
+  // 5. Encode/Decode Shared (Heuristic/Default for now)
+  // TODO: Find a better way using AMDSMI, maybe check IP block info if available?
+  static_info->encode_decode_shared = false; // Default assumption
+
+  // 6. Total VRAM for this partition/GPU
+  if (_amdsmi_get_gpu_vram_info) {
+      amdsmi_vram_info_t vram_info;
+      ret = _amdsmi_get_gpu_vram_info(gpu_info->processor_handle, &vram_info);
+      if (ret == AMDSMI_STATUS_SUCCESS) {
+          SET_GPUINFO_STATIC(static_info, total_memory, vram_info.vram_size_bytes); // Assuming this is per-handle
+          // Note: nvtop internally uses total_memory in dynamic_info, let's set it there too
+          // or adjust nvtop's usage later.
+      } else {
+          // Maybe fallback to usage total if info fails?
+          amdsmi_vram_usage_t vram_usage;
+          ret = _amdsmi_get_gpu_vram_usage(gpu_info->processor_handle, &vram_usage);
+          if (ret == AMDSMI_STATUS_SUCCESS) {
+              SET_GPUINFO_STATIC(static_info, total_memory, vram_usage.vram_total);
+          }
+      }
+  }
+
+  // 7. Max Clocks (GFX/MEM)
+  if (_amdsmi_get_clock_info) {
+      amdsmi_clk_info_t clk_info;
+      ret = _amdsmi_get_clock_info(gpu_info->processor_handle, AMDSMI_CLK_TYPE_GFX, &clk_info);
+      if (ret == AMDSMI_STATUS_SUCCESS) {
+          SET_GPUINFO_STATIC(static_info, gpu_clock_speed_max, clk_info.max_clk);
+      }
+      ret = _amdsmi_get_clock_info(gpu_info->processor_handle, AMDSMI_CLK_TYPE_MEM, &clk_info);
+      if (ret == AMDSMI_STATUS_SUCCESS) {
+          SET_GPUINFO_STATIC(static_info, mem_clock_speed_max, clk_info.max_clk);
+      }
+  }
+
+#else // Fallback to libdrm/sysfs
+  struct gpu_info_amdsmi *gpu_info = container_of(_gpu_info, struct gpu_info_amdsmi, base);
   struct gpuinfo_static_info *static_info = &gpu_info->base.static_info;
   bool info_query_success = false;
   struct amdgpu_gpu_info info;
@@ -649,16 +1058,169 @@ static void gpuinfo_amdgpu_populate_static_info(struct gpu_info *_gpu_info) {
       static_info->encode_decode_shared = vcn_ip_info.hw_ip_version_major >= 4;
     }
   }
+#endif
 }
 
-static void gpuinfo_amdgpu_refresh_dynamic_info(struct gpu_info *_gpu_info) {
-  struct gpu_info_amdgpu *gpu_info = container_of(_gpu_info, struct gpu_info_amdgpu, base);
+static void gpuinfo_amdsmi_refresh_dynamic_info(struct gpu_info *_gpu_info) {
+  struct gpu_info_amdsmi *gpu_info = container_of(_gpu_info, struct gpu_info_amdsmi, base);
   struct gpuinfo_dynamic_info *dynamic_info = &gpu_info->base.dynamic_info;
+  RESET_ALL(dynamic_info->valid);
+
+#ifdef HAVE_AMDSMI
+  if (!_amdsmi_get_gpu_metrics) {
+    // Fallback or error handling if function pointer is null
+    local_error_string = "amdsmi_get_gpu_metrics not loaded";
+    // Consider falling back to libdrm/sysfs if appropriate, or just return
+    goto amdsmi_fallback; // Use goto to jump to the fallback code
+  }
+
+  amdsmi_gpu_metrics_t metrics;
+  amdsmi_status_t ret = _amdsmi_get_gpu_metrics(gpu_info->processor_handle, &metrics);
+
+  if (ret == AMDSMI_STATUS_SUCCESS) {
+    // --- GPU Clocks ---
+    if (metrics.socket_power_valid) // Use socket_power_valid as a general indicator? Check metrics doc.
+    {
+      if (metrics.average_gfxclk_frequency_valid)
+        SET_GPUINFO_DYNAMIC(dynamic_info, gpu_clock_speed, metrics.average_gfxclk_frequency);
+      if (metrics.gfxclk_max_freq_valid) // Assuming a max clock field exists, adjust if name differs
+         SET_GPUINFO_DYNAMIC(dynamic_info, gpu_clock_speed_max, metrics.gfxclk_max_freq); // Adjust field name if needed
+    }
+
+    // --- Memory Clocks ---
+    if (metrics.average_uclk_frequency_valid)
+      SET_GPUINFO_DYNAMIC(dynamic_info, mem_clock_speed, metrics.average_uclk_frequency);
+     if (metrics.uclk_max_freq_valid) // Assuming a max clock field exists, adjust if name differs
+        SET_GPUINFO_DYNAMIC(dynamic_info, mem_clock_speed_max, metrics.uclk_max_freq); // Adjust field name if needed
+
+
+    // --- Utilization ---
+    if (metrics.average_gfx_activity_valid)
+      SET_GPUINFO_DYNAMIC(dynamic_info, gpu_util_rate, metrics.average_gfx_activity);
+
+    // --- Memory Usage ---
+    // Note: amdsmi_gpu_metrics_t might not directly provide total/used/free memory.
+    // We might need to keep the amdsmi_get_gpu_vram_usage call or use info from static populate.
+    // Let's check if metrics provides vram usage percentage directly
+     if (metrics.vram_usage_valid) {
+       // Assuming total memory is already populated in static info
+       if (gpu_info->base.static_info.total_memory > 0) {
+         uint64_t used_mem = (uint64_t)metrics.vram_usage * gpu_info->base.static_info.total_memory / 100;
+         SET_GPUINFO_DYNAMIC(dynamic_info, used_memory, used_mem);
+         SET_GPUINFO_DYNAMIC(dynamic_info, free_memory, gpu_info->base.static_info.total_memory - used_mem);
+         SET_GPUINFO_DYNAMIC(dynamic_info, mem_util_rate, metrics.vram_usage);
+       }
+     } else {
+        // Fallback: Query VRAM usage separately if metrics doesn't provide it
+        amdsmi_vram_usage_t vram_info;
+        if (_amdsmi_get_gpu_vram_usage && _amdsmi_get_gpu_vram_usage(gpu_info->processor_handle, &vram_info) == AMDSMI_STATUS_SUCCESS) {
+           SET_GPUINFO_DYNAMIC(dynamic_info, used_memory, vram_info.vram_used);
+            // Assuming total memory is already populated in static info
+            if (gpu_info->base.static_info.total_memory > 0) {
+                 SET_GPUINFO_DYNAMIC(dynamic_info, free_memory, gpu_info->base.static_info.total_memory - vram_info.vram_used);
+                 SET_GPUINFO_DYNAMIC(dynamic_info, mem_util_rate, (uint32_t)(vram_info.vram_used * 100 / gpu_info->base.static_info.total_memory));
+            }
+        }
+     }
+
+
+    // --- Temperature ---
+    // amdsmi_gpu_metrics_t may contain multiple temperature sensors (junction, edge, mem)
+    // Choosing 'edge' temperature as the default GPU temp for now.
+    if (metrics.temperature_edge_valid)
+      SET_GPUINFO_DYNAMIC(dynamic_info, gpu_temp, metrics.temperature_edge); // Temperature likely in Celsius
+
+    // --- Fan Speed ---
+    // Check if metrics contains fan speed percentage
+    if (metrics.fan_speed_rpm_valid) // Assuming an RPM field, might need conversion to %
+    {
+        // If metrics gives RPM, we might need max RPM from static info or another call
+        // Let's assume metrics.current_fan_speed is percentage for now, adjust if needed.
+        if (metrics.current_fan_speed_valid)
+             SET_GPUINFO_DYNAMIC(dynamic_info, fan_speed, metrics.current_fan_speed); // Assuming this is percentage
+         else {
+             // Fallback: Query fan speed separately
+             uint32_t fan_speed_val = 0;
+             uint64_t fan_speed_rpm = 0; // Use uint64_t for RPM
+             if (_amdsmi_get_gpu_fan_speed && _amdsmi_get_gpu_fan_speed(gpu_info->processor_handle, 0, &fan_speed_rpm) == AMDSMI_STATUS_SUCCESS) {
+                 // Need max RPM to calculate percentage. Placeholder: Assume 100% if RPM > 0 for now.
+                 // TODO: Get max fan speed (e.g., from static info or another amdsmi call)
+                 // For now, just indicate activity if RPM > 0
+                 // If we have max fan speed (e.g., gpu_info->maxFanRpm):
+                 // fan_speed_val = (uint32_t)(fan_speed_rpm * 100 / gpu_info->maxFanRpm);
+                 // Placeholder logic:
+                 fan_speed_val = (fan_speed_rpm > 0) ? 100 : 0; // Very basic placeholder
+                 SET_GPUINFO_DYNAMIC(dynamic_info, fan_speed, fan_speed_val);
+             }
+         }
+    }
+
+
+    // --- Power Draw ---
+    if (metrics.average_socket_power_valid)
+      SET_GPUINFO_DYNAMIC(dynamic_info, power_draw, (uint64_t)metrics.average_socket_power * 1000); // Assuming power is in Watts, convert to mW
+
+    // --- PCIe --- - Keep existing logic for now, potentially refine later
+    nvtop_pcie_link curr_link_characteristics;
+    int ret_pcie = nvtop_device_current_pcie_link(gpu_info->amdgpuDevice, &curr_link_characteristics);
+    if (ret_pcie >= 0) {
+      SET_GPUINFO_DYNAMIC(dynamic_info, pcie_link_width, curr_link_characteristics.width);
+      unsigned pcieGen = nvtop_pcie_gen_from_link_speed(curr_link_characteristics.speed);
+      SET_GPUINFO_DYNAMIC(dynamic_info, pcie_link_gen, pcieGen);
+    }
+
+    // Try getting PCIe bandwidth from AMDSMI if available
+    amdsmi_pcie_bandwidth_t pcie_bw;
+     if (_amdsmi_get_pcie_bandwidth && _amdsmi_get_pcie_bandwidth(gpu_info->processor_handle, &pcie_bw) == AMDSMI_STATUS_SUCCESS && pcie_bw.pcie_bandwidth_inst_valid) {
+        // Convert bytes per second to KiB/s
+        SET_GPUINFO_DYNAMIC(dynamic_info, pcie_rx, pcie_bw.pcie_bandwidth_inst[AMDSMI_PCIE_BW_RECEIVED] / 1024);
+        SET_GPUINFO_DYNAMIC(dynamic_info, pcie_tx, pcie_bw.pcie_bandwidth_inst[AMDSMI_PCIE_BW_SENT] / 1024);
+     } else if (gpu_info->PCIeBW) { // Fallback to sysfs
+      uint64_t received, transmitted;
+      int maxPayloadSize;
+      int NreadPatterns =
+          rewindAndReadPattern(gpu_info->PCIeBW, "%\" SCNu64 \" %\" SCNu64 \" %i\", &received, &transmitted, &maxPayloadSize);
+      if (NreadPatterns == 3) {
+        received *= maxPayloadSize;
+        transmitted *= maxPayloadSize;
+        received /= 1024;
+        transmitted /= 1024;
+        SET_GPUINFO_DYNAMIC(dynamic_info, pcie_rx, received);
+        SET_GPUINFO_DYNAMIC(dynamic_info, pcie_tx, transmitted);
+      }
+    }
+
+
+    // --- Power Cap --- - Keep existing logic for now, potentially refine later
+    // Can potentially use _amdsmi_get_power_cap_info here
+    if (gpu_info->powerCap) {
+      unsigned powerCap;
+      int NreadPatterns = rewindAndReadPattern(gpu_info->powerCap, \"%u\", &powerCap);
+      if (NreadPatterns == 1) {
+        SET_GPUINFO_DYNAMIC(dynamic_info, power_draw_max, powerCap / 1000);
+      }
+    }
+
+    return; // Successfully populated using AMDSMI metrics
+
+  } else {
+    // Log error or handle failure to get metrics
+    char error_buf[256];
+    snprintf(error_buf, sizeof(error_buf), "amdsmi_get_gpu_metrics failed: %s",
+             _amdsmi_status_code_to_string ? _amdsmi_status_code_to_string(ret) : "Unknown AMDSMI error");
+    local_error_string = strdup(error_buf); // Note: needs free later if strdup used
+    // Fall through to libdrm/sysfs fallback path
+  }
+
+amdsmi_fallback:; // Label for goto jump
+
+#else // Fallback to libdrm/sysfs if HAVE_AMDSMI is not defined
+
   bool info_query_success = false;
   struct amdgpu_gpu_info info;
   uint32_t out32;
 
-  RESET_ALL(dynamic_info->valid);
+  // RESET_ALL(dynamic_info->valid); // Already done at the start
 
   if (libdrm_amdgpu_handle && _amdgpu_query_gpu_info)
     info_query_success = !_amdgpu_query_gpu_info(gpu_info->amdgpu_device, &info);
@@ -712,11 +1274,23 @@ static void gpuinfo_amdgpu_refresh_dynamic_info(struct gpu_info *_gpu_info) {
     last_libdrm_return_status = 1;
   if (!last_libdrm_return_status) {
     // TODO: Determine if we want to include GTT (GPU accessible system memory)
-    SET_GPUINFO_DYNAMIC(dynamic_info, total_memory, memory_info.vram.total_heap_size);
+    // Assuming total memory populated during static phase or from vram_info above if AMDSMI
+    if (gpu_info->base.static_info.total_memory == 0) {
+        // Populate total memory if not already set (should be set in static)
+         SET_GPUINFO_DYNAMIC(dynamic_info, total_memory, memory_info.vram.total_heap_size);
+    } else {
+        dynamic_info->total_memory = gpu_info->base.static_info.total_memory; // Ensure consistency
+        VALIDATE_GPUINFO_DYNAMIC(dynamic_info, total_memory);
+    }
+
     SET_GPUINFO_DYNAMIC(dynamic_info, used_memory, memory_info.vram.heap_usage);
-    SET_GPUINFO_DYNAMIC(dynamic_info, free_memory, memory_info.vram.total_heap_size - dynamic_info->used_memory);
-    SET_GPUINFO_DYNAMIC(dynamic_info, mem_util_rate,
-                        (dynamic_info->total_memory - dynamic_info->free_memory) * 100 / dynamic_info->total_memory);
+    if (IS_VALID_GPUINFO_DYNAMIC(dynamic_info, total_memory)) {
+         SET_GPUINFO_DYNAMIC(dynamic_info, free_memory, dynamic_info->total_memory - dynamic_info->used_memory);
+         if (dynamic_info->total_memory > 0) {
+             SET_GPUINFO_DYNAMIC(dynamic_info, mem_util_rate,
+                                (dynamic_info->used_memory) * 100 / dynamic_info->total_memory);
+         }
+    }
   }
 
   // GPU temperature
@@ -730,11 +1304,15 @@ static void gpuinfo_amdgpu_refresh_dynamic_info(struct gpu_info *_gpu_info) {
   }
 
   // Fan speed
-  unsigned currentFanSpeed;
-  int patternsMatched = rewindAndReadPattern(gpu_info->fanSpeedFILE, "%u", &currentFanSpeed);
-  if (patternsMatched == 1) {
-    SET_GPUINFO_DYNAMIC(dynamic_info, fan_speed, currentFanSpeed * 100 / gpu_info->maxFanValue);
+  // Use sysfs if available
+  if (gpu_info->fanSpeedFILE) {
+    unsigned currentFanSpeed;
+    int patternsMatched = rewindAndReadPattern(gpu_info->fanSpeedFILE, "%u", &currentFanSpeed);
+    if (patternsMatched == 1 && gpu_info->maxFanValue > 0) { // Check maxFanValue
+      SET_GPUINFO_DYNAMIC(dynamic_info, fan_speed, currentFanSpeed * 100 / gpu_info->maxFanValue);
+    }
   }
+
 
   // Device power usage
   if (libdrm_amdgpu_handle && _amdgpu_query_sensor_info)
@@ -746,6 +1324,7 @@ static void gpuinfo_amdgpu_refresh_dynamic_info(struct gpu_info *_gpu_info) {
     SET_GPUINFO_DYNAMIC(dynamic_info, power_draw, out32 * 1000);
   }
 
+  // PCIe Link Info (kept the same as before)
   nvtop_pcie_link curr_link_characteristics;
   int ret = nvtop_device_current_pcie_link(gpu_info->amdgpuDevice, &curr_link_characteristics);
   if (ret >= 0) {
@@ -754,19 +1333,15 @@ static void gpuinfo_amdgpu_refresh_dynamic_info(struct gpu_info *_gpu_info) {
     SET_GPUINFO_DYNAMIC(dynamic_info, pcie_link_gen, pcieGen);
   }
 
-  // PCIe bandwidth
+  // PCIe bandwidth (kept the same as before)
   if (gpu_info->PCIeBW) {
-    // According to https://github.com/torvalds/linux/blob/master/drivers/gpu/drm/amd/pm/amdgpu_pm.c, under the pcie_bw
-    // section, we should be able to read the number of packets received and sent by the GPU and get the maximum payload
-    // size during the last second. This is untested but should work when the file is populated by the driver.
     uint64_t received, transmitted;
     int maxPayloadSize;
     int NreadPatterns =
-        rewindAndReadPattern(gpu_info->PCIeBW, "%" SCNu64 " %" SCNu64 " %i", &received, &transmitted, &maxPayloadSize);
+        rewindAndReadPattern(gpu_info->PCIeBW, "%\" SCNu64 \" %\" SCNu64 \" %i\", &received, &transmitted, &maxPayloadSize);
     if (NreadPatterns == 3) {
       received *= maxPayloadSize;
       transmitted *= maxPayloadSize;
-      // Set in KiB
       received /= 1024;
       transmitted /= 1024;
       SET_GPUINFO_DYNAMIC(dynamic_info, pcie_rx, received);
@@ -774,14 +1349,15 @@ static void gpuinfo_amdgpu_refresh_dynamic_info(struct gpu_info *_gpu_info) {
     }
   }
 
+  // Power Cap (kept the same as before)
   if (gpu_info->powerCap) {
-    // The power cap in microwatts
     unsigned powerCap;
     int NreadPatterns = rewindAndReadPattern(gpu_info->powerCap, "%u", &powerCap);
     if (NreadPatterns == 1) {
       SET_GPUINFO_DYNAMIC(dynamic_info, power_draw_max, powerCap / 1000);
     }
   }
+#endif // HAVE_AMDSMI
 }
 
 static const char drm_amdgpu_pdev_old[] = "pdev";
@@ -797,7 +1373,7 @@ static const char drm_amdgpu_enc_old[] = "enc";
 static const char drm_amdgpu_enc[] = "drm-engine-enc";
 
 static bool parse_drm_fdinfo_amd(struct gpu_info *info, FILE *fdinfo_file, struct gpu_process *process_info) {
-  struct gpu_info_amdgpu *gpu_info = container_of(info, struct gpu_info_amdgpu, base);
+  struct gpu_info_amdsmi *gpu_info = container_of(info, struct gpu_info_amdsmi, base);
   struct gpuinfo_static_info *static_info = &gpu_info->base.static_info;
   static char *line = NULL;
   static size_t line_buf_size = 0;
@@ -919,9 +1495,9 @@ static bool parse_drm_fdinfo_amd(struct gpu_info *info, FILE *fdinfo_file, struc
   // which uses an internal update interval. Now, we can compute an accurate
   // busy percentage since the last measurement.
   if (client_id_set) {
-    struct amdgpu_process_info_cache *cache_entry;
+    struct amdsmi_process_info_cache *cache_entry;
     struct unique_cache_id ucid = {.client_id = cid, .pid = process_info->pid, .pdev = gpu_info->base.pdev};
-    HASH_FIND_CLIENT(gpu_info->last_update_process_cache, &ucid, cache_entry);
+    HASH_FIND_PID_PDEV(gpu_info->last_update_process_cache, cid, gpu_info->base.pdev, cache_entry);
     if (cache_entry) {
       uint64_t time_elapsed = nvtop_difftime_u64(cache_entry->last_measurement_tstamp, current_time);
       HASH_DEL(gpu_info->last_update_process_cache, cache_entry);
@@ -977,8 +1553,8 @@ static bool parse_drm_fdinfo_amd(struct gpu_info *info, FILE *fdinfo_file, struc
 
 #ifndef NDEBUG
     // We should only process one fdinfo entry per client id per update
-    struct amdgpu_process_info_cache *cache_entry_check;
-    HASH_FIND_CLIENT(gpu_info->current_update_process_cache, &cache_entry->client_id, cache_entry_check);
+    struct amdsmi_process_info_cache *cache_entry_check;
+    HASH_FIND_PID_PDEV(gpu_info->current_update_process_cache, cid, gpu_info->base.pdev, cache_entry_check);
     assert(!cache_entry_check && "We should not be processing a client id twice per update");
 #endif
 
@@ -994,17 +1570,17 @@ static bool parse_drm_fdinfo_amd(struct gpu_info *info, FILE *fdinfo_file, struc
       SET_AMDGPU_CACHE(cache_entry, enc_engine_used, process_info->enc_engine_used);
 
     cache_entry->last_measurement_tstamp = current_time;
-    HASH_ADD_CLIENT(gpu_info->current_update_process_cache, cache_entry);
+    HASH_ADD_PID_PDEV(gpu_info->current_update_process_cache, cache_entry);
   }
 
 parse_fdinfo_exit:
   return true;
 }
 
-static void swap_process_cache_for_next_update(struct gpu_info_amdgpu *gpu_info) {
+static void swap_process_cache_for_next_update(struct gpu_info_amdsmi *gpu_info) {
   // Free old cache data and set the cache for the next update
   if (gpu_info->last_update_process_cache) {
-    struct amdgpu_process_info_cache *cache_entry, *tmp;
+    struct amdsmi_process_info_cache *cache_entry, *tmp;
     HASH_ITER(hh, gpu_info->last_update_process_cache, cache_entry, tmp) {
       HASH_DEL(gpu_info->last_update_process_cache, cache_entry);
       free(cache_entry);
@@ -1014,9 +1590,9 @@ static void swap_process_cache_for_next_update(struct gpu_info_amdgpu *gpu_info)
   gpu_info->current_update_process_cache = NULL;
 }
 
-static void gpuinfo_amdgpu_get_running_processes(struct gpu_info *_gpu_info) {
+static void gpuinfo_amdsmi_get_running_processes(struct gpu_info *_gpu_info) {
   // For AMDGPU, we register a fdinfo callback that will fill the gpu_process datastructure of the gpu_info structure
   // for us. This avoids going through /proc multiple times per update for multiple GPUs.
-  struct gpu_info_amdgpu *gpu_info = container_of(_gpu_info, struct gpu_info_amdgpu, base);
+  struct gpu_info_amdsmi *gpu_info = container_of(_gpu_info, struct gpu_info_amdsmi, base);
   swap_process_cache_for_next_update(gpu_info);
 }
