@@ -27,6 +27,8 @@
 #include "nvtop/extract_gpuinfo_common.h"
 #include "nvtop/extract_processinfo_fdinfo.h"
 #include "nvtop/time.h"
+// Include header needed for get_process_cmdline/get_process_user_name (assuming Linux)
+#include "nvtop/get_process_info.h"
 
 #include <assert.h>
 #include <dirent.h>
@@ -81,15 +83,12 @@ static typeof(amdsmi_get_temp_metric) *_amdsmi_get_temp_metric;
 static typeof(amdsmi_get_gpu_fan_speed) *_amdsmi_get_gpu_fan_speed;
 static typeof(amdsmi_get_power_info) *_amdsmi_get_power_info;
 static typeof(amdsmi_get_power_cap_info) *_amdsmi_get_power_cap_info;
-static typeof(amdsmi_get_pcie_link_status) *_amdsmi_get_pcie_link_status;
-static typeof(amdsmi_get_pcie_link_caps) *_amdsmi_get_pcie_link_caps;
-static typeof(amdsmi_get_pcie_throughput) *_amdsmi_get_pcie_throughput;
+static typeof(amdsmi_get_gpu_pci_link_caps) *_amdsmi_get_gpu_pci_link_caps; // Renamed based on likely actual API
 static typeof(amdsmi_get_gpu_activity) *_amdsmi_get_gpu_activity;
 static typeof(amdsmi_get_gpu_process_list) *_amdsmi_get_gpu_process_list;
-static typeof(amdsmi_get_gpu_process_info) *_amdsmi_get_gpu_process_info;
 static typeof(amdsmi_status_code_to_string) *_amdsmi_status_code_to_string;
-static typeof(amdsmi_get_gpu_metrics) *_amdsmi_get_gpu_metrics;
-static typeof(amdsmi_get_pcie_bandwidth) *_amdsmi_get_pcie_bandwidth;
+static typeof(amdsmi_get_gpu_metrics) *_amdsmi_get_gpu_metrics; // Seems correct based on header source
+static typeof(amdsmi_get_gpu_pci_bandwidth) *_amdsmi_get_gpu_pci_bandwidth; // Renamed based on likely actual API
 // Add other needed amdsmi function pointers here...
 
 static void *libamdsmi_handle;
@@ -288,15 +287,12 @@ static bool gpuinfo_amdsmi_init(void) {
   _amdsmi_get_gpu_fan_speed = dlsym(libamdsmi_handle, "amdsmi_get_gpu_fan_speed");
   _amdsmi_get_power_info = dlsym(libamdsmi_handle, "amdsmi_get_power_info");
   _amdsmi_get_power_cap_info = dlsym(libamdsmi_handle, "amdsmi_get_power_cap_info");
-  _amdsmi_get_pcie_link_status = dlsym(libamdsmi_handle, "amdsmi_get_pcie_link_status");
-  _amdsmi_get_pcie_link_caps = dlsym(libamdsmi_handle, "amdsmi_get_pcie_link_caps");
-  _amdsmi_get_pcie_throughput = dlsym(libamdsmi_handle, "amdsmi_get_pcie_throughput");
+  _amdsmi_get_gpu_pci_link_caps = dlsym(libamdsmi_handle, "amdsmi_get_gpu_pci_link_caps");
   _amdsmi_get_gpu_activity = dlsym(libamdsmi_handle, "amdsmi_get_gpu_activity");
   _amdsmi_get_gpu_process_list = dlsym(libamdsmi_handle, "amdsmi_get_gpu_process_list");
-  _amdsmi_get_gpu_process_info = dlsym(libamdsmi_handle, "amdsmi_get_gpu_process_info");
   _amdsmi_status_code_to_string = dlsym(libamdsmi_handle, "amdsmi_status_code_to_string");
   _amdsmi_get_gpu_metrics = dlsym(libamdsmi_handle, "amdsmi_get_gpu_metrics");
-  _amdsmi_get_pcie_bandwidth = dlsym(libamdsmi_handle, "amdsmi_get_pcie_bandwidth");
+  _amdsmi_get_gpu_pci_bandwidth = dlsym(libamdsmi_handle, "amdsmi_get_gpu_pci_bandwidth");
 
   // Check essential functions needed for basic operation and info gathering
   if (!_amdsmi_init || !_amdsmi_shut_down || !_amdsmi_get_processor_handles ||
@@ -304,14 +300,13 @@ static bool gpuinfo_amdsmi_init(void) {
       !_amdsmi_status_code_to_string ||
       // Static info functions
       !_amdsmi_get_gpu_asic_info || !_amdsmi_get_gpu_board_info || !_amdsmi_get_gpu_vram_info ||
-      !_amdsmi_get_clock_info || !_amdsmi_get_temp_metric || !_amdsmi_get_pcie_link_caps ||
+      !_amdsmi_get_clock_info || !_amdsmi_get_temp_metric || !_amdsmi_get_gpu_pci_link_caps ||
       // Dynamic info functions (for refresh)
-      !_amdsmi_get_gpu_metrics || !_amdsmi_get_gpu_vram_usage || !_amdsmi_get_pcie_bandwidth ||
+      !_amdsmi_get_gpu_metrics || !_amdsmi_get_gpu_vram_usage || !_amdsmi_get_gpu_pci_bandwidth ||
       // Optional but useful static info
       !_amdsmi_get_gpu_fan_speed || !_amdsmi_get_power_info || !_amdsmi_get_power_cap_info ||
-      !_amdsmi_get_pcie_link_status ||
       // Process list functions (potentially optional depending on usage)
-      !_amdsmi_get_gpu_process_list || !_amdsmi_get_gpu_process_info
+      !_amdsmi_get_gpu_process_list || !_amdsmi_get_gpu_activity
       // !_amdsmi_get_gpu_activity // Keep activity optional for now
      ) {
     local_error_string = "Failed to load required AMD SMI functions";
@@ -530,8 +525,10 @@ static void initDeviceSysfsPaths(struct gpu_info_amdsmi *gpu_info) {
     // Open the power cap file for dynamic info gathering
     gpu_info->powerCap = NULL;
     int powerCapFD = openat(hwmonFD, "power1_cap", O_RDONLY);
-    if (powerCapFD) {
+    if (powerCapFD) { // Check if openat succeeded
       gpu_info->powerCap = fdopen(powerCapFD, "r");
+       if (!gpu_info->powerCap) // Check fdopen
+          close(powerCapFD);
     }
     close(hwmonFD);
   }
@@ -540,8 +537,10 @@ static void initDeviceSysfsPaths(struct gpu_info_amdsmi *gpu_info) {
   // Open the PCIe bandwidth file for dynamic info gathering
   gpu_info->PCIeBW = NULL;
   int pcieBWFD = openat(sysfsFD, "pcie_bw", O_RDONLY);
-  if (pcieBWFD) {
+  if (pcieBWFD) { // Check if openat succeeded
     gpu_info->PCIeBW = fdopen(pcieBWFD, "r");
+    if (!gpu_info->PCIeBW) // Check fdopen
+        close(pcieBWFD);
   }
 
   close(sysfsFD);
@@ -889,9 +888,9 @@ static void gpuinfo_amdsmi_populate_static_info(struct gpu_info *_gpu_info) {
   // }
 
   // 3. Max PCIe Link Info
-  if (_amdsmi_get_pcie_link_caps) {
+  if (_amdsmi_get_gpu_pci_link_caps) {
       amdsmi_pcie_link_caps_t pcie_caps;
-      ret = _amdsmi_get_pcie_link_caps(gpu_info->processor_handle, &pcie_caps);
+      ret = _amdsmi_get_gpu_pci_link_caps(gpu_info->processor_handle, &pcie_caps);
       if (ret == AMDSMI_STATUS_SUCCESS) {
           SET_GPUINFO_STATIC(static_info, max_pcie_link_width, pcie_caps.max_lanes);
           // Speed is often reported directly in GT/s in the API struct, needs verification
@@ -1198,7 +1197,7 @@ static void gpuinfo_amdsmi_refresh_dynamic_info(struct gpu_info *_gpu_info) {
 
     // Try getting PCIe bandwidth from AMDSMI if available
     amdsmi_pcie_bandwidth_t pcie_bw;
-     if (_amdsmi_get_pcie_bandwidth && _amdsmi_get_pcie_bandwidth(gpu_info->processor_handle, &pcie_bw) == AMDSMI_STATUS_SUCCESS && pcie_bw.pcie_bandwidth_inst_valid) {
+     if (_amdsmi_get_gpu_pci_bandwidth && _amdsmi_get_gpu_pci_bandwidth(gpu_info->processor_handle, &pcie_bw) == AMDSMI_STATUS_SUCCESS && pcie_bw.pcie_bandwidth_inst_valid) {
         // Convert bytes per second to KiB/s
         SET_GPUINFO_DYNAMIC(dynamic_info, pcie_rx, pcie_bw.pcie_bandwidth_inst[AMDSMI_PCIE_BW_RECEIVED] / 1024);
         SET_GPUINFO_DYNAMIC(dynamic_info, pcie_tx, pcie_bw.pcie_bandwidth_inst[AMDSMI_PCIE_BW_SENT] / 1024);
@@ -1407,9 +1406,14 @@ static bool parse_drm_fdinfo_amd(struct gpu_info *info, FILE *fdinfo_file, struc
   ssize_t count = 0;
 
   bool client_id_set = false;
-  unsigned cid;
+  unsigned cid = 0; // Initialize cid
   nvtop_time current_time;
   nvtop_get_current_time(&current_time);
+
+  // Initialize calculated usage fields
+  RESET_GPUINFO_PROCESS(process_info, gpu_usage);
+  RESET_GPUINFO_PROCESS(process_info, encode_usage);
+  RESET_GPUINFO_PROCESS(process_info, decode_usage);
 
   while ((count = getline(&line, &line_buf_size, fdinfo_file)) != -1) {
     char *key, *val;
@@ -1424,6 +1428,7 @@ static bool parse_drm_fdinfo_amd(struct gpu_info *info, FILE *fdinfo_file, struc
     // see drivers/gpu/drm/amd/amdgpu/amdgpu_fdinfo.c amdgpu_show_fdinfo()
     if (!strcmp(key, drm_amdgpu_pdev_old) || !strcmp(key, drm_pdev)) {
       if (strcmp(val, gpu_info->base.pdev)) {
+         free(line); line = NULL; line_buf_size = 0; // Free line buffer before returning false
         return false;
       }
     } else if (!strcmp(key, drm_client_id)) {
@@ -1445,6 +1450,12 @@ static bool parse_drm_fdinfo_amd(struct gpu_info *info, FILE *fdinfo_file, struc
         continue;
 
       SET_GPUINFO_PROCESS(process_info, gpu_memory_usage, mem_int * 1024);
+      // Calculate percentage using dynamic total memory if available
+      if (GPUINFO_DYNAMIC_FIELD_VALID(&gpu_info->base.dynamic_info, total_memory) && gpu_info->base.dynamic_info.total_memory > 0) {
+          unsigned percentage = (unsigned) ((mem_int * 1024 * 100) / gpu_info->base.dynamic_info.total_memory);
+          SET_GPUINFO_PROCESS(process_info, gpu_memory_percentage, percentage);
+      }
+
     } else {
       bool is_gfx_old = !strncmp(key, drm_amdgpu_gfx_old, sizeof(drm_amdgpu_gfx_old) - 1);
       bool is_compute_old = !strncmp(key, drm_amdgpu_compute_old, sizeof(drm_amdgpu_compute_old) - 1);
@@ -1480,7 +1491,9 @@ static bool parse_drm_fdinfo_amd(struct gpu_info *info, FILE *fdinfo_file, struc
         if (*endptr)
           continue;
 
-        usage_percent_int = (unsigned int)(usage_percent = round(strtod(val, &endptr)));
+        usage_percent = strtod(val, &endptr); // No rounding needed here
+        usage_percent_int = (unsigned int)usage_percent; // Truncate/cast
+
         if (endptr == val || strcmp(endptr, "%"))
           continue;
 
@@ -1523,85 +1536,94 @@ static bool parse_drm_fdinfo_amd(struct gpu_info *info, FILE *fdinfo_file, struc
   // busy percentage since the last measurement.
   if (client_id_set) {
     struct amdsmi_process_info_cache *cache_entry;
-    struct unique_cache_id ucid = {.client_id = cid, .pid = process_info->pid, .pdev = gpu_info->base.pdev};
-    HASH_FIND_PID_PDEV(gpu_info->last_update_process_cache, cid, gpu_info->base.pdev, cache_entry);
+    // Construct key using pid and pdev (client_id/cid is not part of the key struct)
+    struct unique_cache_id search_key = {.pid = process_info->pid, .pdev = gpu_info->base.pdev};
+    HASH_FIND(hh, gpu_info->last_update_process_cache, &search_key, sizeof(struct unique_cache_id), cache_entry);
+    // HASH_FIND_PID_PDEV(gpu_info->last_update_process_cache, process_info->pid, gpu_info->base.pdev, cache_entry); // Use macro
+
     if (cache_entry) {
-      uint64_t time_elapsed = nvtop_difftime_u64(cache_entry->last_measurement_tstamp, current_time);
-      HASH_DEL(gpu_info->last_update_process_cache, cache_entry);
-      if (GPUINFO_PROCESS_FIELD_VALID(process_info, gfx_engine_used) &&
-          AMDGPU_CACHE_FIELD_VALID(cache_entry, gfx_engine_used) &&
-          // In some rare occasions, the gfx engine usage reported by the driver is lowering (might be a driver bug)
-          process_info->gfx_engine_used >= cache_entry->gfx_engine_used &&
-          process_info->gfx_engine_used - cache_entry->gfx_engine_used <= time_elapsed) {
-        SET_GPUINFO_PROCESS(process_info, gpu_usage,
-                            busy_usage_from_time_usage_round(process_info->gfx_engine_used,
-                                                             cache_entry->gfx_engine_used, time_elapsed));
+      uint64_t time_elapsed_ns = nvtop_difftime_u64(cache_entry->last_measurement_tstamp, current_time);
+      // Removed HASH_DEL here, update cache at the end
+      if (time_elapsed_ns > 0) { // Avoid division by zero
+        if (GPUINFO_PROCESS_FIELD_VALID(process_info, gfx_engine_used) &&
+            AMDSMI_CACHE_FIELD_VALID(cache_entry, gfx_engine_ns) &&
+            // In some rare occasions, the gfx engine usage reported by the driver is lowering (might be a driver bug)
+            process_info->gfx_engine_used >= cache_entry->gfx_engine_ns &&
+            process_info->gfx_engine_used - cache_entry->gfx_engine_ns <= time_elapsed_ns) { // Compare ns with ns
+          SET_GPUINFO_PROCESS(process_info, gpu_usage,
+                              busy_usage_from_time_usage_round(process_info->gfx_engine_used,
+                                                               cache_entry->gfx_engine_ns, time_elapsed_ns));
+        }
+        if (GPUINFO_PROCESS_FIELD_VALID(process_info, compute_engine_used) &&
+            AMDSMI_CACHE_FIELD_VALID(cache_entry, compute_engine_ns) &&
+            process_info->compute_engine_used >= cache_entry->compute_engine_ns &&
+            process_info->compute_engine_used - cache_entry->compute_engine_ns <= time_elapsed_ns) {
+          unsigned gfx_usage = GPUINFO_PROCESS_FIELD_VALID(process_info, gpu_usage) ? process_info->gpu_usage : 0;
+          // Accumulate compute usage into gpu_usage
+          SET_GPUINFO_PROCESS(process_info, gpu_usage,
+                              gfx_usage + busy_usage_from_time_usage_round(process_info->compute_engine_used,
+                                                                           cache_entry->compute_engine_ns,
+                                                                           time_elapsed_ns));
+        }
+        if (GPUINFO_PROCESS_FIELD_VALID(process_info, dec_engine_used) &&
+            AMDSMI_CACHE_FIELD_VALID(cache_entry, dec_engine_ns) &&
+            process_info->dec_engine_used >= cache_entry->dec_engine_ns &&
+            process_info->dec_engine_used - cache_entry->dec_engine_ns <= time_elapsed_ns) {
+          SET_GPUINFO_PROCESS(process_info, decode_usage,
+                              busy_usage_from_time_usage_round(process_info->dec_engine_used,
+                                                               cache_entry->dec_engine_ns, time_elapsed_ns));
+        }
+        if (GPUINFO_PROCESS_FIELD_VALID(process_info, enc_engine_used) &&
+            AMDSMI_CACHE_FIELD_VALID(cache_entry, enc_engine_ns) &&
+            process_info->enc_engine_used >= cache_entry->enc_engine_ns &&
+            process_info->enc_engine_used - cache_entry->enc_engine_ns <= time_elapsed_ns) {
+          SET_GPUINFO_PROCESS(process_info, encode_usage,
+                              busy_usage_from_time_usage_round(process_info->enc_engine_used,
+                                                               cache_entry->enc_engine_ns, time_elapsed_ns));
+        }
       }
-      if (GPUINFO_PROCESS_FIELD_VALID(process_info, compute_engine_used) &&
-          AMDGPU_CACHE_FIELD_VALID(cache_entry, compute_engine_used) &&
-          process_info->compute_engine_used >= cache_entry->compute_engine_used &&
-          process_info->compute_engine_used - cache_entry->compute_engine_used <= time_elapsed) {
-        unsigned gfx_usage = GPUINFO_PROCESS_FIELD_VALID(process_info, gpu_usage) ? process_info->gpu_usage : 0;
-        SET_GPUINFO_PROCESS(process_info, gpu_usage,
-                            gfx_usage + busy_usage_from_time_usage_round(process_info->compute_engine_used,
-                                                                         cache_entry->compute_engine_used,
-                                                                         time_elapsed));
-      }
-      if (GPUINFO_PROCESS_FIELD_VALID(process_info, dec_engine_used) &&
-          AMDGPU_CACHE_FIELD_VALID(cache_entry, dec_engine_used) &&
-          process_info->dec_engine_used >= cache_entry->dec_engine_used &&
-          process_info->dec_engine_used - cache_entry->dec_engine_used <= time_elapsed) {
-        SET_GPUINFO_PROCESS(process_info, decode_usage,
-                            busy_usage_from_time_usage_round(process_info->dec_engine_used,
-                                                             cache_entry->dec_engine_used, time_elapsed));
-      }
-      if (GPUINFO_PROCESS_FIELD_VALID(process_info, enc_engine_used) &&
-          AMDGPU_CACHE_FIELD_VALID(cache_entry, enc_engine_used) &&
-          process_info->enc_engine_used >= cache_entry->enc_engine_used &&
-          process_info->enc_engine_used - cache_entry->enc_engine_used <= time_elapsed) {
-        SET_GPUINFO_PROCESS(process_info, encode_usage,
-                            busy_usage_from_time_usage_round(process_info->enc_engine_used,
-                                                             cache_entry->enc_engine_used, time_elapsed));
-      }
-    } else {
-      cache_entry = calloc(1, sizeof(*cache_entry));
-      if (!cache_entry)
-        goto parse_fdinfo_exit;
-      cache_entry->client_id.client_id = cid;
-      cache_entry->client_id.pid = process_info->pid;
-      cache_entry->client_id.pdev = gpu_info->base.pdev;
     }
+
+    // Upsert current data into the current_update_process_cache
+    struct amdsmi_process_info_cache *cache_entry_check;
+    struct unique_cache_id current_key = {.pid = process_info->pid, .pdev = gpu_info->base.pdev};
+    HASH_FIND(hh, gpu_info->current_update_process_cache, &current_key, sizeof(struct unique_cache_id), cache_entry_check);
+
+    if (!cache_entry_check) { // Entry doesn't exist, create and add
+        cache_entry_check = calloc(1, sizeof(struct amdsmi_process_info_cache));
+        if (!cache_entry_check)
+            goto parse_fdinfo_exit; // Or handle error more gracefully
+        cache_entry_check->client_id.pid = process_info->pid;
+        cache_entry_check->client_id.pdev = gpu_info->base.pdev; // Assuming pdev string lifetime is managed
+        HASH_ADD(hh, gpu_info->current_update_process_cache, client_id, sizeof(struct unique_cache_id), cache_entry_check);
+    }
+
+    // Update the cache entry with current values
+    RESET_ALL(cache_entry_check->valid); // Reset validity before setting new values
+    if (GPUINFO_PROCESS_FIELD_VALID(process_info, gfx_engine_used))
+      SET_AMDSMI_CACHE(cache_entry_check, gfx_engine_ns, process_info->gfx_engine_used);
+    if (GPUINFO_PROCESS_FIELD_VALID(process_info, compute_engine_used))
+      SET_AMDSMI_CACHE(cache_entry_check, compute_engine_ns, process_info->compute_engine_used);
+    if (GPUINFO_PROCESS_FIELD_VALID(process_info, dec_engine_used))
+      SET_AMDSMI_CACHE(cache_entry_check, dec_engine_ns, process_info->dec_engine_used);
+    if (GPUINFO_PROCESS_FIELD_VALID(process_info, enc_engine_used))
+      SET_AMDSMI_CACHE(cache_entry_check, enc_engine_ns, process_info->enc_engine_used);
+
+    cache_entry_check->last_measurement_tstamp = current_time;
 
     // The UI only shows the decode usage when `encode_decode_shared` is true
     // but amdgpu should only use the encode usage field when it is shared.
     // Lets add both together for good measure.
-    if (static_info->encode_decode_shared)
-      SET_GPUINFO_PROCESS(process_info, decode_usage, process_info->decode_usage + process_info->encode_usage);
-
-#ifndef NDEBUG
-    // We should only process one fdinfo entry per client id per update
-    struct amdsmi_process_info_cache *cache_entry_check;
-    HASH_FIND_PID_PDEV(gpu_info->current_update_process_cache, cid, gpu_info->base.pdev, cache_entry_check);
-    assert(!cache_entry_check && "We should not be processing a client id twice per update");
-#endif
-
-    // Store this measurement data
-    RESET_ALL(cache_entry->valid);
-    if (GPUINFO_PROCESS_FIELD_VALID(process_info, gfx_engine_used))
-      SET_AMDGPU_CACHE(cache_entry, gfx_engine_used, process_info->gfx_engine_used);
-    if (GPUINFO_PROCESS_FIELD_VALID(process_info, compute_engine_used))
-      SET_AMDGPU_CACHE(cache_entry, compute_engine_used, process_info->compute_engine_used);
-    if (GPUINFO_PROCESS_FIELD_VALID(process_info, dec_engine_used))
-      SET_AMDGPU_CACHE(cache_entry, dec_engine_used, process_info->dec_engine_used);
-    if (GPUINFO_PROCESS_FIELD_VALID(process_info, enc_engine_used))
-      SET_AMDGPU_CACHE(cache_entry, enc_engine_used, process_info->enc_engine_used);
-
-    cache_entry->last_measurement_tstamp = current_time;
-    HASH_ADD_PID_PDEV(gpu_info->current_update_process_cache, cache_entry);
+    if (static_info->encode_decode_shared) {
+        unsigned enc_usage = GPUINFO_PROCESS_FIELD_VALID(process_info, encode_usage) ? process_info->encode_usage : 0;
+        unsigned dec_usage = GPUINFO_PROCESS_FIELD_VALID(process_info, decode_usage) ? process_info->decode_usage : 0;
+        SET_GPUINFO_PROCESS(process_info, decode_usage, dec_usage + enc_usage);
+    }
   }
 
 parse_fdinfo_exit:
-  return true;
+  free(line); line = NULL; line_buf_size = 0; // Free line buffer
+  return true; // Return true if pdev matched or if no pdev was found (process all files)
 }
 
 static void swap_process_cache_for_next_update(struct gpu_info_amdsmi *gpu_info) {
@@ -1609,6 +1631,7 @@ static void swap_process_cache_for_next_update(struct gpu_info_amdsmi *gpu_info)
   struct amdsmi_process_info_cache *cache_entry, *tmp;
   HASH_ITER(hh, gpu_info->last_update_process_cache, cache_entry, tmp) {
     HASH_DEL(gpu_info->last_update_process_cache, cache_entry);
+    // Consider freeing cache_entry->client_id.pdev if it was duplicated
     free(cache_entry);
   }
   // Swap pointers
@@ -1618,7 +1641,7 @@ static void swap_process_cache_for_next_update(struct gpu_info_amdsmi *gpu_info)
 
 static void gpuinfo_amdsmi_get_running_processes(struct gpu_info *_gpu_info) {
 #ifdef HAVE_AMDSMI
-  // Implementation using amdsmi_get_gpu_process_list / amdsmi_get_gpu_process_info
+  // Implementation using amdsmi_get_gpu_process_list
   struct gpu_info_amdsmi *gpu_info = container_of(_gpu_info, struct gpu_info_amdsmi, base);
   struct gpuinfo_dynamic_info *dynamic_info = &gpu_info->base.dynamic_info;
   struct gpuinfo_static_info *static_info = &gpu_info->base.static_info;
@@ -1632,26 +1655,35 @@ static void gpuinfo_amdsmi_get_running_processes(struct gpu_info *_gpu_info) {
   }
 
   // First call to get the number of processes
-  ret = _amdsmi_get_gpu_process_list(gpu_info->processor_handle, NULL, &num_procs);
+  // Signature: amdsmi_get_gpu_process_list(amdsmi_processor_handle processor_handle, uint32_t* num_elements, amdsmi_proc_info_t* procs)
+  ret = _amdsmi_get_gpu_process_list(gpu_info->processor_handle, &num_procs, NULL); // Corrected order: num_elements first
   if (ret != AMDSMI_STATUS_SUCCESS || num_procs == 0) {
     if (ret != AMDSMI_STATUS_SUCCESS && ret != AMDSMI_STATUS_NOT_FOUND) { // NOT_FOUND is ok if no processes
-      local_error_string = _amdsmi_status_code_to_string ? _amdsmi_status_code_to_string(ret) : "AMDSMI Error";
+       // Corrected call to status_code_to_string
+       if (_amdsmi_status_code_to_string) _amdsmi_status_code_to_string(ret, &local_error_string);
+       else local_error_string = "AMDSMI Error (status code unavailable)";
+    } else {
+        local_error_string = NULL; // Clear error if just not found
     }
+    gpu_info->base.processes_count = 0; // Ensure count is 0 if no processes found or error
     goto end; // No processes or error
   }
 
   proc_info_list = calloc(num_procs, sizeof(amdsmi_proc_info_t));
   if (!proc_info_list) {
     local_error_string = "Failed to allocate memory for process list";
+    gpu_info->base.processes_count = 0;
     goto end;
   }
 
   // Second call to get the actual process list
-  ret = _amdsmi_get_gpu_process_list(gpu_info->processor_handle, proc_info_list, &num_procs);
+  ret = _amdsmi_get_gpu_process_list(gpu_info->processor_handle, &num_procs, proc_info_list); // Corrected order
   if (ret != AMDSMI_STATUS_SUCCESS) {
-    local_error_string = _amdsmi_status_code_to_string ? _amdsmi_status_code_to_string(ret) : "AMDSMI Error";
+    if (_amdsmi_status_code_to_string) _amdsmi_status_code_to_string(ret, &local_error_string);
+    else local_error_string = "AMDSMI Error getting process list (status code unavailable)";
     free(proc_info_list);
     proc_info_list = NULL;
+    gpu_info->base.processes_count = 0;
     goto end;
   }
 
@@ -1660,20 +1692,24 @@ static void gpuinfo_amdsmi_get_running_processes(struct gpu_info *_gpu_info) {
     struct gpu_process *new_processes = realloc(gpu_info->base.processes, num_procs * sizeof(struct gpu_process));
     if (!new_processes) {
       local_error_string = "Failed to reallocate process array";
-      free(proc_info_list);
+      free(proc_info_list); // Free the list obtained from amdsmi
+      // Keep old processes array? Or set count to 0? Set count to 0 for safety.
+      gpu_info->base.processes_count = 0;
       proc_info_list = NULL;
       goto end;
     }
     gpu_info->base.processes = new_processes;
     gpu_info->base.processes_array_size = num_procs;
   }
-  gpu_info->base.processes_count = num_procs;
-  memset(gpu_info->base.processes, 0, num_procs * sizeof(struct gpu_process)); // Clear old data
+  gpu_info->base.processes_count = num_procs; // Set the actual count
+  memset(gpu_info->base.processes, 0, num_procs * sizeof(struct gpu_process)); // Clear old data in target array
 
   // Get time difference for usage calculation
   nvtop_time current_time;
-  get_current_time(&current_time);
-  uint64_t time_elapsed_us = nvtime_diff_us(&dynamic_info->last_measurement_tstamp, &current_time);
+  nvtop_get_current_time(&current_time);
+  // Use the dynamic_info timestamp which is updated at the end of this function in the previous cycle
+  uint64_t time_elapsed_ns = nvtop_difftime_u64(dynamic_info->last_measurement_tstamp, current_time);
+
 
   // Iterate through processes and populate gpu_process struct
   for (uint32_t i = 0; i < num_procs; ++i) {
@@ -1686,22 +1722,22 @@ static void gpuinfo_amdsmi_get_running_processes(struct gpu_info *_gpu_info) {
 
     // Set memory usage directly from amdsmi_proc_info_t
     SET_GPUINFO_PROCESS(process_info, gpu_memory_usage, proc_info_list[i].memory_usage.vram_mem);
-    if (static_info->vram_size > 0) {
+    // Use dynamic total memory which should be up-to-date
+    if (GPUINFO_DYNAMIC_FIELD_VALID(dynamic_info, total_memory) && dynamic_info->total_memory > 0) {
       unsigned percentage =
-          (unsigned)((proc_info_list[i].memory_usage.vram_mem * 100) / static_info->vram_size);
+          (unsigned)((proc_info_list[i].memory_usage.vram_mem * 100) / dynamic_info->total_memory);
       SET_GPUINFO_PROCESS(process_info, gpu_memory_percentage, percentage);
     }
 
-    // Extract engine usage (nanoseconds)
+    // Extract engine usage (nanoseconds) - Assuming correct member names now
     SET_GPUINFO_PROCESS(process_info, gfx_engine_used, proc_info_list[i].engine_usage.gfx_activity);
-    // AMDSMI combines compute into gfx_activity, so compute_engine_used might be 0 or redundant
-    // SET_GPUINFO_PROCESS(process_info, compute_engine_used, 0); // Or assign based on specific logic if available
     SET_GPUINFO_PROCESS(process_info, enc_engine_used, proc_info_list[i].engine_usage.mm_enc_activity);
     SET_GPUINFO_PROCESS(process_info, dec_engine_used, proc_info_list[i].engine_usage.mm_dec_activity);
-    // Add mm_vce_activity, mm_vcn_activity etc. if needed
+    // AMDSMI combines compute into gfx_activity, so compute_engine_used might be 0 or redundant
+    RESET_GPUINFO_PROCESS(process_info, compute_engine_used); // Explicitly invalidate compute
 
     // Calculate usage percentages using cache
-    if (time_elapsed_us > 0) {
+    if (time_elapsed_ns > 0) {
       struct amdsmi_process_info_cache *cache_entry;
       struct unique_cache_id search_key = {.pid = process_info->pid, .pdev = gpu_info->base.pdev};
       HASH_FIND(hh, gpu_info->last_update_process_cache, &search_key, sizeof(struct unique_cache_id), cache_entry);
@@ -1710,26 +1746,26 @@ static void gpuinfo_amdsmi_get_running_processes(struct gpu_info *_gpu_info) {
         if (GPUINFO_PROCESS_FIELD_VALID(process_info, gfx_engine_used) &&
             AMDSMI_CACHE_FIELD_VALID(cache_entry, gfx_engine_ns) &&
             process_info->gfx_engine_used >= cache_entry->gfx_engine_ns &&
-            process_info->gfx_engine_used - cache_entry->gfx_engine_ns <= time_elapsed_us * 1000) {
+            process_info->gfx_engine_used - cache_entry->gfx_engine_ns <= time_elapsed_ns) {
           SET_GPUINFO_PROCESS(process_info, gpu_usage,
                               busy_usage_from_time_usage_round(process_info->gfx_engine_used, cache_entry->gfx_engine_ns,
-                                                               time_elapsed_us * 1000));
+                                                               time_elapsed_ns));
         }
         if (GPUINFO_PROCESS_FIELD_VALID(process_info, enc_engine_used) &&
             AMDSMI_CACHE_FIELD_VALID(cache_entry, enc_engine_ns) &&
             process_info->enc_engine_used >= cache_entry->enc_engine_ns &&
-            process_info->enc_engine_used - cache_entry->enc_engine_ns <= time_elapsed_us * 1000) {
+            process_info->enc_engine_used - cache_entry->enc_engine_ns <= time_elapsed_ns) {
           SET_GPUINFO_PROCESS(process_info, encode_usage,
                               busy_usage_from_time_usage_round(process_info->enc_engine_used,
-                                                               cache_entry->enc_engine_ns, time_elapsed_us * 1000));
+                                                               cache_entry->enc_engine_ns, time_elapsed_ns));
         }
         if (GPUINFO_PROCESS_FIELD_VALID(process_info, dec_engine_used) &&
             AMDSMI_CACHE_FIELD_VALID(cache_entry, dec_engine_ns) &&
             process_info->dec_engine_used >= cache_entry->dec_engine_ns &&
-            process_info->dec_engine_used - cache_entry->dec_engine_ns <= time_elapsed_us * 1000) {
+            process_info->dec_engine_used - cache_entry->dec_engine_ns <= time_elapsed_ns) {
           SET_GPUINFO_PROCESS(process_info, decode_usage,
                               busy_usage_from_time_usage_round(process_info->dec_engine_used,
-                                                               cache_entry->dec_engine_ns, time_elapsed_us * 1000));
+                                                               cache_entry->dec_engine_ns, time_elapsed_ns));
         }
       }
 
@@ -1746,35 +1782,45 @@ static void gpuinfo_amdsmi_get_running_processes(struct gpu_info *_gpu_info) {
           continue; // Skip this process
         }
         cache_entry_check->client_id.pid = process_info->pid;
-        // Need to duplicate pdev string or ensure lifetime? Assume gpu_info->base.pdev is stable
+        // Need to duplicate pdev string or ensure lifetime? Assume gpu_info->base.pdev is stable & long-lived
         cache_entry_check->client_id.pdev = gpu_info->base.pdev;
         HASH_ADD(hh, gpu_info->current_update_process_cache, client_id, sizeof(struct unique_cache_id),
                  cache_entry_check);
       }
+      // Update cache entry with current nanosecond counts
+      RESET_ALL(cache_entry_check->valid); // Reset validity bits
       if (GPUINFO_PROCESS_FIELD_VALID(process_info, gfx_engine_used))
         SET_AMDSMI_CACHE(cache_entry_check, gfx_engine_ns, process_info->gfx_engine_used);
-      // SET_AMDSMI_CACHE(cache_entry_check, compute_engine_ns, process_info->compute_engine_used); // If tracked
+      // SET_AMDSMI_CACHE(cache_entry_check, compute_engine_ns, process_info->compute_engine_used); // Compute not tracked/valid
       if (GPUINFO_PROCESS_FIELD_VALID(process_info, enc_engine_used))
         SET_AMDSMI_CACHE(cache_entry_check, enc_engine_ns, process_info->enc_engine_used);
       if (GPUINFO_PROCESS_FIELD_VALID(process_info, dec_engine_used))
         SET_AMDSMI_CACHE(cache_entry_check, dec_engine_ns, process_info->dec_engine_used);
       cache_entry_check->last_measurement_tstamp = current_time;
+    } else {
+        // No time elapsed, cannot calculate usage percentages
+        RESET_GPUINFO_PROCESS(process_info, gpu_usage);
+        RESET_GPUINFO_PROCESS(process_info, encode_usage);
+        RESET_GPUINFO_PROCESS(process_info, decode_usage);
     }
+
+     // Combine enc/dec usage if needed by UI (handled by UI now?)
+     // if (static_info->encode_decode_shared) { ... }
   }
 
-  free(proc_info_list);
+  free(proc_info_list); // Free the list obtained from amdsmi
 
 #else // Fallback to fdinfo parsing if AMDSMI is not available
   struct gpu_info_amdsmi *gpu_info = container_of(_gpu_info, struct gpu_info_amdsmi, base);
   // Use the generic fdinfo parser
   extract_processinfo_fdinfo(gpu_info->base.pdev, &gpu_info->base.processes_count, &gpu_info->base.processes,
                              &gpu_info->base.processes_array_size,
-                             (process_data_parser_func)parse_drm_fdinfo_amd, gpu_info);
+                             (process_data_parser_func)parse_drm_fdinfo_amd, _gpu_info); // Pass gpu_info struct
 #endif // HAVE_AMDSMI
 
 end:
   // Common cleanup/final steps for both paths
   swap_process_cache_for_next_update(container_of(_gpu_info, struct gpu_info_amdsmi, base));
   // Update last measurement timestamp AFTER processing is complete
-  get_current_time(&container_of(_gpu_info, struct gpu_info_amdsmi, base)->base.dynamic_info.last_measurement_tstamp);
+  nvtop_get_current_time(&container_of(_gpu_info, struct gpu_info_amdsmi, base)->base.dynamic_info.last_measurement_tstamp);
 }
